@@ -116,6 +116,29 @@ class PromptCombinator:
 
         return prompts, ids, filenames
 
+def execute(self, prompts_1, combination_ids_1, prompts_2, combination_ids_2):
+    combined_prompts = self.merge_lists(prompts_1, prompts_2)
+    combined_ids = self.merge_lists(combination_ids_1, combination_ids_2)
+
+    filenames = []
+    for id_list in combination_ids_1:
+        filename_parts = []
+        for i, id_part in enumerate(id_list):
+            if id_part.startswith('input_'):
+                filename_parts.append(f'input_merge_1_{id_part}')
+            else:
+                filename_parts.append(id_part)
+        filenames.append('-'.join(filename_parts))
+    for id_list in combination_ids_2:
+        filename_parts = []
+        for i, id_part in enumerate(id_list):
+            if id_part.startswith('input_'):
+                filename_parts.append(f'input_merge_2_{id_part}')
+            else:
+                filename_parts.append(id_part)
+        filenames.append('-'.join(filename_parts))
+
+    return combined_prompts, combined_ids, filenames
 
 class PromptCombinatorMerger:
     """
@@ -132,6 +155,7 @@ class PromptCombinatorMerger:
                 "combination_ids_1": ("PROMPTCOMBINATORIDS",),
                 "prompts_2": ("STRING", {"forceInput": True}),
                 "combination_ids_2": ("PROMPTCOMBINATORIDS",),
+                "use_product_merge": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -150,29 +174,63 @@ class PromptCombinatorMerger:
             list1 = []
         if not list2:
             list2 = []
+		
         return list1 + list2
+    
+    def prpduct_merge_lists(self, list1, list2):
+        if not list1:
+            list1 = []
+        if not list2:
+            list2 = []
+		
+        outputs = [f"{x}\n{y}" for x, y in product(list1, list2)]
+        return outputs
+    
+    def map_id_lists(self, list1, list2):
+        if not list1:
+            list1 = []
+        if not list2:
+            list2 = []
 
-    def execute(self, prompts_1, combination_ids_1, prompts_2, combination_ids_2):
-        combined_prompts = self.merge_lists(prompts_1, prompts_2)
-        combined_ids = self.merge_lists(combination_ids_1, combination_ids_2)
+        outputs = [x + y for x, y in product(list1, list2)]
+        return outputs
 
-        filenames = []
-        for id_list in combination_ids_1:
-            filename_parts = []
-            for i, id_part in enumerate(id_list):
-                if id_part.startswith('input_'):
-                    filename_parts.append(f'input_merge_1_{id_part}')
-                else:
-                    filename_parts.append(id_part)
-            filenames.append('-'.join(filename_parts))
-        for id_list in combination_ids_2:
-            filename_parts = []
-            for i, id_part in enumerate(id_list):
-                if id_part.startswith('input_'):
-                    filename_parts.append(f'input_merge_2_{id_part}')
-                else:
-                    filename_parts.append(id_part)
-            filenames.append('-'.join(filename_parts))
+    def execute(self, prompts_1, combination_ids_1, prompts_2, combination_ids_2, use_product_merge):
+        print(type(use_product_merge))
+        if use_product_merge[0] :
+            print(f"running map list")
+            combined_prompts = self.prpduct_merge_lists(prompts_1, prompts_2)
+            combined_ids = self.map_id_lists(combination_ids_1, combination_ids_2)
+
+            print(f"{combined_ids}")
+            filenames = []
+            for id_list in combined_ids:
+                filename_parts = [id_part for id_part in id_list]
+                filenames.append('-'.join(filename_parts))
+
+        else:
+            print(f"running merge list")
+            combined_prompts = self.merge_lists(prompts_1, prompts_2)
+            combined_ids = self.merge_lists(combination_ids_1, combination_ids_2)
+            print(f"{combined_ids}")
+
+            filenames = []
+            for id_list in combination_ids_1:
+                filename_parts = []
+                for i, id_part in enumerate(id_list):
+                    if id_part.startswith('input_'):
+                        filename_parts.append(f'input_merge_1_{id_part}')
+                    else:
+                        filename_parts.append(id_part)
+                filenames.append('-'.join(filename_parts))
+            for id_list in combination_ids_2:
+                filename_parts = []
+                for i, id_part in enumerate(id_list):
+                    if id_part.startswith('input_'):
+                        filename_parts.append(f'input_merge_2_{id_part}')
+                    else:
+                        filename_parts.append(id_part)
+                filenames.append('-'.join(filename_parts))
 
         return combined_prompts, combined_ids, filenames
 
@@ -404,10 +462,25 @@ class PromptCombinatorRandomPrompt:
 
     CATEGORY = "prompt_combinator"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, seed=None):
+        # Naming 'seed' here disables ComfyUI's default INT validation for it.
+        # Needed because the auto-added 'control_after_generate' widget can serialize
+        # the seed as a string like 'randomize' when INPUT_IS_LIST is True.
+        return True
+
     def pick_random(self, prompts, combination_ids, seed):
         assert len(combination_ids) == len(prompts), "Amount of combination ids must be the same as amount of prompts"
-    
-        index = random.randint(0, len(prompts) - 1)
+
+        # seed arrives as a list (INPUT_IS_LIST). Use it to seed the RNG when it's a
+        # valid integer, otherwise fall back to non-deterministic selection.
+        seed_value = seed[0] if isinstance(seed, (list, tuple)) and seed else seed
+        try:
+            rng = random.Random(int(seed_value))
+        except (TypeError, ValueError):
+            rng = random
+
+        index = rng.randint(0, len(prompts) - 1)
         prompt = prompts[index]
         combination_id = combination_ids[index]
 
