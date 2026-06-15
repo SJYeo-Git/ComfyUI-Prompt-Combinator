@@ -1,4 +1,5 @@
 from itertools import product
+from datetime import datetime
 import re
 import random
 import os
@@ -480,108 +481,104 @@ class PromptCombinatorRandomPrompt:
         return (prompt, combination_id, filename)
 
 
-class PromptCombinatorLooper:
+class PromptCombinatorDateTime:
     """
     ComfyUI-Prompt-Combinator
     https://github.com/lquesada/ComfyUI-Prompt-Combinator
 
-    Stateful node that walks a JSON array of {name, prompt} entries one step per
-    queued prompt. It outputs the (name, prompt) at the current index, repeating
-    each entry 'counter_max' times before advancing to the next index.
-
-    The counters live on the node instance and auto-advance across runs, so the
-    workflow can be queued repeatedly (e.g. via auto-queue / batch count) to sweep
-    the whole array. Toggle 'reset' to start over from the beginning.
-    
-    example: [
-    {"name": "sunset", "prompt": "a serene sunset over the ocean, warm orange tones"},
-    {"name": "forest", "prompt": "a misty pine forest at dawn, soft light"},
-    {"name": "city",   "prompt": "a neon-lit cyberpunk city street at night, rain"}
-    ]
-
+    Node that outputs the current date and date-time as strings, using
+    configurable strftime formats. Useful for stamping filenames or prompts.
     """
-    def __init__(self):
-        # current_index: which array entry we are on (0-based).
-        # counter_current: how many times the current entry has been emitted so far
-        #                  this cycle (1-based, matching the spec's default of 1).
-        self.current_index = 0
-        self.counter_current = 1
-        self._initialized = False
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # JSON array of objects: [{"name": "...", "prompt": "..."}, ...]
-                "json_array": ("STRING", {"default": '[\n  {"name": "", "prompt": ""}\n]', "multiline": True}),
-                # How many times each entry is emitted before advancing to the next.
-                "counter_max": ("INT", {"default": 1, "min": 1, "max": 0xffffffff}),
-                # Flip to True to restart from index 0 on the next run.
-                "reset": ("BOOLEAN", {"default": False}),
+                "date_format": ("STRING", {"default": "%Y-%m-%d"}),
+                "datetime_format": ("STRING", {"default": "%Y-%m-%d %H:%M:%S"}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "INT", "BOOLEAN")
-    RETURN_NAMES = ("name", "prompt", "current_index", "counter_current", "finished")
-    FUNCTION = "step"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("date", "datetime")
+    FUNCTION = "get_datetime"
 
     CATEGORY = "prompt_combinator"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # Force ComfyUI to re-execute on every queue so the internal counters
-        # actually advance (otherwise cached outputs would freeze the loop).
+        # Always re-execute so the timestamp reflects the current run.
         return float("NaN")
+
+    def get_datetime(self, date_format, datetime_format):
+        now = datetime.now()
+        date_str = now.strftime(date_format)
+        datetime_str = now.strftime(datetime_format)
+        print(f"[PromptCombinator/DateTime] date={date_str!r} datetime={datetime_str!r}")
+        return (date_str, datetime_str)
+
+
+class PromptCombinatorLooperAll:
+    """
+    ComfyUI-Prompt-Combinator
+    https://github.com/lquesada/ComfyUI-Prompt-Combinator
+
+    Reads a JSON array of {name, prompt} entries and outputs them all at once as
+    lists, so a single Queue click sweeps every entry (rather than one per queue).
+
+    Because the outputs are lists (OUTPUT_IS_LIST), ComfyUI automatically runs the
+    downstream chain (CLIP Text Encode -> KSampler -> Save) once per entry, so a
+    single Queue click generates an image for every index.
+
+    Set 'repeat_each' > 1 to emit each entry that many times in a row.
+
+    example: [
+    {"name": "sunset", "prompt": "a serene sunset over the ocean, warm orange tones"},
+    {"name": "forest", "prompt": "a misty pine forest at dawn, soft light"},
+    {"name": "city",   "prompt": "a neon-lit cyberpunk city street at night, rain"}
+    ]
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "json_array": ("STRING", {"default": '[\n  {"name": "", "prompt": ""}\n]', "multiline": True}),
+                "repeat_each": ("INT", {"default": 1, "min": 1, "max": 0xffffffff}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("name", "prompt", "index")
+    OUTPUT_IS_LIST = (True, True, True)
+    FUNCTION = "expand"
+
+    CATEGORY = "prompt_combinator"
 
     def _parse_array(self, json_array):
         try:
             data = json.loads(json_array) if json_array.strip() else []
         except json.JSONDecodeError as e:
-            raise ValueError(f"[PromptCombinator/Looper] json_array is not valid JSON: {e}")
-        assert isinstance(data, list), "[PromptCombinator/Looper] json_array must be a JSON array (e.g. [{\"name\": \"\", \"prompt\": \"\"}])"
+            raise ValueError(f"[PromptCombinator/LooperAll] json_array is not valid JSON: {e}")
+        assert isinstance(data, list), "[PromptCombinator/LooperAll] json_array must be a JSON array (e.g. [{\"name\": \"\", \"prompt\": \"\"}])"
         entries = []
         for i, item in enumerate(data):
-            assert isinstance(item, dict), f"[PromptCombinator/Looper] entry {i} must be an object with 'name' and 'prompt'"
+            assert isinstance(item, dict), f"[PromptCombinator/LooperAll] entry {i} must be an object with 'name' and 'prompt'"
             entries.append((str(item.get("name", "")), str(item.get("prompt", ""))))
         return entries
 
-    def step(self, json_array, counter_max, reset):
+    def expand(self, json_array, repeat_each):
         entries = self._parse_array(json_array)
-        counter_max = max(1, int(counter_max))
+        repeat_each = max(1, int(repeat_each))
 
-        if reset or not self._initialized:
-            self.current_index = 0
-            self.counter_current = 1
-            self._initialized = True
+        names = []
+        prompts = []
+        indices = []
+        for idx, (name, prompt) in enumerate(entries):
+            for _ in range(repeat_each):
+                names.append(name)
+                prompts.append(prompt)
+                indices.append(idx)
 
-        total = len(entries)
+        print(f"[PromptCombinator/LooperAll] expanded {len(entries)} entries "
+              f"x{repeat_each} -> {len(names)} outputs")
 
-        # Empty array: nothing to emit, report finished.
-        if total == 0:
-            print("[PromptCombinator/Looper] json_array is empty")
-            return ("", "", 0, self.counter_current, True)
-
-        # If we've already walked past the end, hold on the last entry and report
-        # finished instead of indexing out of range.
-        if self.current_index >= total:
-            name, prompt = entries[total - 1]
-            print(f"[PromptCombinator/Looper] finished: held on last index {total - 1}")
-            return (name, prompt, total - 1, self.counter_current, True)
-
-        read_index = self.current_index
-        name, prompt = entries[read_index]
-        emitted_counter = self.counter_current
-
-        # Advance: bump the per-entry counter; once it exceeds counter_max, move to
-        # the next index and reset the per-entry counter back to 1.
-        self.counter_current += 1
-        if self.counter_current > counter_max:
-            self.current_index += 1
-            self.counter_current = 1
-
-        finished = self.current_index >= total
-        print(f"[PromptCombinator/Looper] emitted index {read_index} "
-              f"({emitted_counter}/{counter_max}) name={name!r} "
-              f"-> next index {self.current_index}, finished={finished}")
-
-        return (name, prompt, read_index, emitted_counter, finished)
+        return (names, prompts, indices)
