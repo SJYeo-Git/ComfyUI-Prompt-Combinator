@@ -3,6 +3,7 @@ import re
 import random
 import os
 import base64
+import json
 
 import folder_paths
 
@@ -116,29 +117,6 @@ class PromptCombinator:
 
         return prompts, ids, filenames
 
-def execute(self, prompts_1, combination_ids_1, prompts_2, combination_ids_2):
-    combined_prompts = self.merge_lists(prompts_1, prompts_2)
-    combined_ids = self.merge_lists(combination_ids_1, combination_ids_2)
-
-    filenames = []
-    for id_list in combination_ids_1:
-        filename_parts = []
-        for i, id_part in enumerate(id_list):
-            if id_part.startswith('input_'):
-                filename_parts.append(f'input_merge_1_{id_part}')
-            else:
-                filename_parts.append(id_part)
-        filenames.append('-'.join(filename_parts))
-    for id_list in combination_ids_2:
-        filename_parts = []
-        for i, id_part in enumerate(id_list):
-            if id_part.startswith('input_'):
-                filename_parts.append(f'input_merge_2_{id_part}')
-            else:
-                filename_parts.append(id_part)
-        filenames.append('-'.join(filename_parts))
-
-    return combined_prompts, combined_ids, filenames
 
 class PromptCombinatorMerger:
     """
@@ -177,7 +155,7 @@ class PromptCombinatorMerger:
 		
         return list1 + list2
     
-    def prpduct_merge_lists(self, list1, list2):
+    def product_merge_lists(self, list1, list2):
         if not list1:
             list1 = []
         if not list2:
@@ -199,7 +177,7 @@ class PromptCombinatorMerger:
         print(type(use_product_merge))
         if use_product_merge[0] :
             print(f"running map list")
-            combined_prompts = self.prpduct_merge_lists(prompts_1, prompts_2)
+            combined_prompts = self.product_merge_lists(prompts_1, prompts_2)
             combined_ids = self.map_id_lists(combination_ids_1, combination_ids_2)
 
             print(f"{combined_ids}")
@@ -470,15 +448,26 @@ class PromptCombinatorRandomPrompt:
         return True
 
     def pick_random(self, prompts, combination_ids, seed):
-        assert len(combination_ids) == len(prompts), "Amount of combination ids must be the same as amount of prompts"
+        print(f"[PromptCombinator/PickRandom] received {len(prompts)} prompts, "
+              f"{len(combination_ids)} ids, raw seed={seed!r}")
+        for i, (p, cid) in enumerate(zip(prompts, combination_ids)):
+            preview = ' '.join(str(p).split())[:80]
+            print(f"[PromptCombinator/PickRandom]   item {i}: id={cid!r} prompt={preview!r}...")
+
+        assert len(combination_ids) == len(prompts), \
+            f"[PromptCombinator/PickRandom] Amount of combination ids ({len(combination_ids)}) " \
+            f"must be the same as amount of prompts ({len(prompts)})"
 
         # seed arrives as a list (INPUT_IS_LIST). Use it to seed the RNG when it's a
         # valid integer, otherwise fall back to non-deterministic selection.
         seed_value = seed[0] if isinstance(seed, (list, tuple)) and seed else seed
         try:
             rng = random.Random(int(seed_value))
+            print(f"[PromptCombinator/PickRandom] using seeded RNG with seed={int(seed_value)}")
         except (TypeError, ValueError):
             rng = random
+            print(f"[PromptCombinator/PickRandom] seed {seed_value!r} is not an int; "
+                  f"falling back to non-deterministic selection")
 
         index = rng.randint(0, len(prompts) - 1)
         prompt = prompts[index]
@@ -486,4 +475,113 @@ class PromptCombinatorRandomPrompt:
 
         filename = '-'.join(combination_id)
 
+        print(f"[PromptCombinator/PickRandom] picked index {index} -> filename={filename!r}")
+
         return (prompt, combination_id, filename)
+
+
+class PromptCombinatorLooper:
+    """
+    ComfyUI-Prompt-Combinator
+    https://github.com/lquesada/ComfyUI-Prompt-Combinator
+
+    Stateful node that walks a JSON array of {name, prompt} entries one step per
+    queued prompt. It outputs the (name, prompt) at the current index, repeating
+    each entry 'counter_max' times before advancing to the next index.
+
+    The counters live on the node instance and auto-advance across runs, so the
+    workflow can be queued repeatedly (e.g. via auto-queue / batch count) to sweep
+    the whole array. Toggle 'reset' to start over from the beginning.
+    
+    example: [
+    {"name": "sunset", "prompt": "a serene sunset over the ocean, warm orange tones"},
+    {"name": "forest", "prompt": "a misty pine forest at dawn, soft light"},
+    {"name": "city",   "prompt": "a neon-lit cyberpunk city street at night, rain"}
+    ]
+
+    """
+    def __init__(self):
+        # current_index: which array entry we are on (0-based).
+        # counter_current: how many times the current entry has been emitted so far
+        #                  this cycle (1-based, matching the spec's default of 1).
+        self.current_index = 0
+        self.counter_current = 1
+        self._initialized = False
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                # JSON array of objects: [{"name": "...", "prompt": "..."}, ...]
+                "json_array": ("STRING", {"default": '[\n  {"name": "", "prompt": ""}\n]', "multiline": True}),
+                # How many times each entry is emitted before advancing to the next.
+                "counter_max": ("INT", {"default": 1, "min": 1, "max": 0xffffffff}),
+                # Flip to True to restart from index 0 on the next run.
+                "reset": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "INT", "BOOLEAN")
+    RETURN_NAMES = ("name", "prompt", "current_index", "counter_current", "finished")
+    FUNCTION = "step"
+
+    CATEGORY = "prompt_combinator"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Force ComfyUI to re-execute on every queue so the internal counters
+        # actually advance (otherwise cached outputs would freeze the loop).
+        return float("NaN")
+
+    def _parse_array(self, json_array):
+        try:
+            data = json.loads(json_array) if json_array.strip() else []
+        except json.JSONDecodeError as e:
+            raise ValueError(f"[PromptCombinator/Looper] json_array is not valid JSON: {e}")
+        assert isinstance(data, list), "[PromptCombinator/Looper] json_array must be a JSON array (e.g. [{\"name\": \"\", \"prompt\": \"\"}])"
+        entries = []
+        for i, item in enumerate(data):
+            assert isinstance(item, dict), f"[PromptCombinator/Looper] entry {i} must be an object with 'name' and 'prompt'"
+            entries.append((str(item.get("name", "")), str(item.get("prompt", ""))))
+        return entries
+
+    def step(self, json_array, counter_max, reset):
+        entries = self._parse_array(json_array)
+        counter_max = max(1, int(counter_max))
+
+        if reset or not self._initialized:
+            self.current_index = 0
+            self.counter_current = 1
+            self._initialized = True
+
+        total = len(entries)
+
+        # Empty array: nothing to emit, report finished.
+        if total == 0:
+            print("[PromptCombinator/Looper] json_array is empty")
+            return ("", "", 0, self.counter_current, True)
+
+        # If we've already walked past the end, hold on the last entry and report
+        # finished instead of indexing out of range.
+        if self.current_index >= total:
+            name, prompt = entries[total - 1]
+            print(f"[PromptCombinator/Looper] finished: held on last index {total - 1}")
+            return (name, prompt, total - 1, self.counter_current, True)
+
+        read_index = self.current_index
+        name, prompt = entries[read_index]
+        emitted_counter = self.counter_current
+
+        # Advance: bump the per-entry counter; once it exceeds counter_max, move to
+        # the next index and reset the per-entry counter back to 1.
+        self.counter_current += 1
+        if self.counter_current > counter_max:
+            self.current_index += 1
+            self.counter_current = 1
+
+        finished = self.current_index >= total
+        print(f"[PromptCombinator/Looper] emitted index {read_index} "
+              f"({emitted_counter}/{counter_max}) name={name!r} "
+              f"-> next index {self.current_index}, finished={finished}")
+
+        return (name, prompt, read_index, emitted_counter, finished)
